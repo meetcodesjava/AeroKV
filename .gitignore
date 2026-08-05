@@ -1,0 +1,12 @@
+# Maven build output directory
+target/
+
+# Local Write-Ahead Log directory/files
+*AeroKV_logs*
+
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project/
