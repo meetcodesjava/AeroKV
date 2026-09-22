@@ -4,23 +4,20 @@ public class AeroLockManager {
     private final Object[] locks;
     private final int numStripes;
 
-    public AeroLockManager(int numStripes){
-        this.numStripes=numStripes;
-        this.locks=new Object[numStripes];
-
-
-        for(int i=0;i<numStripes;i++){
-            locks[i]=new Object();
+    public AeroLockManager(int numStripes) {
+        this.numStripes = numStripes;
+        this.locks = new Object[numStripes];
+        for (int i = 0; i < numStripes; i++) {
+            this.locks[i] = new Object();
         }
     }
 
-    public Object getLock(String key){
-        if (key==null) {
-            return locks[0];
-        }
-
-
-        int idx = Math.abs(key.hashCode()) % numStripes;
-        return locks[idx];
+    /**
+     * Maps a given key to a specific lock stripe using its hash code.
+     */
+    public Object getLock(String key) {
+        int hash = key.hashCode();
+        int stripeIndex = Math.abs(hash % numStripes);
+        return locks[stripeIndex];
     }
 }

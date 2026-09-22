@@ -4,29 +4,86 @@ import day03.AeroLRU;
 
 public class AeroConcurrentLRU {
 
-    private final AeroLRU cache;
-    private final AeroLockManager lockManager;
+    // Internal wrapper to support Time-To-Live (TTL)
+    private static class CacheEntry {
+        final Object value;
+        final long expiresAtMillis;
 
-    public AeroConcurrentLRU(int capacity, int numStripes){
-        this.cache=new AeroLRU(capacity);
-        this.lockManager=new AeroLockManager(numStripes);
-    }
+        CacheEntry(Object value, long ttlMillis) {
+            this.value = value;
+            this.expiresAtMillis = (ttlMillis > 0) ? (System.currentTimeMillis() + ttlMillis) : -1;
+        }
 
-
-    public Object get(String key){
-        Object lock=lockManager.getLock(key);
-
-        synchronized (lock) {
-            return cache.get(key);
+        boolean isExpired() {
+            return expiresAtMillis != -1 && System.currentTimeMillis() > expiresAtMillis;
         }
     }
 
+    private final AeroLRU cache;
+    private final AeroLockManager lockManager;
 
-    public void put(String key, Object val){
-        Object lock=lockManager.getLock(key);
+    public AeroConcurrentLRU(int capacity, int numStripes) {
+        this.cache = new AeroLRU(capacity);
+        this.lockManager = new AeroLockManager(numStripes);
+    }
 
+    /**
+     * Thread-safe get with lazy TTL expiration check.
+     */
+    public Object get(String key) {
+        Object lock = lockManager.getLock(key);
         synchronized (lock) {
-            cache.put(key, val);
+            CacheEntry entry = (CacheEntry) cache.get(key);
+            if (entry == null) {
+                return null;
+            }
+            if (entry.isExpired()) {
+                cache.remove(key);
+                return null;
+            }
+            return entry.value;
+        }
+    }
+
+    /**
+     * Standard put without expiration (lives until evicted by LRU).
+     */
+    public void put(String key, Object val) {
+        put(key, val, -1);
+    }
+
+    /**
+     * Put with specific Time-To-Live in milliseconds.
+     */
+    public void put(String key, Object val, long ttlMillis) {
+        Object lock = lockManager.getLock(key);
+        synchronized (lock) {
+            cache.put(key, new CacheEntry(val, ttlMillis));
+        }
+    }
+
+    /**
+     * Atomic put-if-absent (returns true if acquired, false if already taken).
+     */
+    public boolean putIfAbsent(String key, Object val, long ttlMillis) {
+        Object lock = lockManager.getLock(key);
+        synchronized (lock) {
+            CacheEntry current = (CacheEntry) cache.get(key);
+            if (current != null && !current.isExpired()) {
+                return false; // Key is already actively held
+            }
+            cache.put(key, new CacheEntry(val, ttlMillis));
+            return true;
+        }
+    }
+
+    /**
+     * Explicit removal of a key.
+     */
+    public void remove(String key) {
+        Object lock = lockManager.getLock(key);
+        synchronized (lock) {
+            cache.remove(key);
         }
     }
 }

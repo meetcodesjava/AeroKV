@@ -15,7 +15,6 @@ public class AeroKVServerApp {
 
             server.start();
         } catch (Exception e) {
-            // TODO: handle exception
             System.err.println("Failed to start AeroKV server: " + e.getMessage());
         }
     }

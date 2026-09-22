@@ -1,3 +1,5 @@
+*.class
+
 # Maven build output directory
 target/
 
