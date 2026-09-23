@@ -116,8 +116,7 @@ AeroKV/
 ├── src/
 │   ├── app.py                  # Sample Python client
 │   ├── benchmark.py            # Multi-threaded benchmark utility
-│   ├── extreme.py              # High-concurrency stress test with latency percentiles
-│   ├── test_all.py             # Functional verification suite (LRU, framing, locks, etc.)
+│   ├── production_suite.py     # End-to-end production readiness suite
 │   │
 │   └── main/
 │       └── java/
@@ -199,25 +198,24 @@ python benchmark.py
 
 The benchmark creates multiple concurrent client threads that perform `SET` and `GET` operations and reports the total execution time, successful operations, and throughput.
 
-### Run the Stress Test
+### Run the Production Readiness Suite
 
-To push the server with heavy concurrency and measure latency distribution, execute:
-
-```bash
-cd src
-python extreme.py
-```
-
-This runs 50 concurrent client threads performing a mixed 30% write / 70% read workload against a small key range (to force lock contention) and reports throughput along with average, p50, p95, and p99 latencies.
-
-### Run the Verification Suite
-
-To validate correctness across LRU eviction, TCP framing/pipelining, stripe-lock contention, thread-pool saturation, and payload delimiter integrity, execute:
+To validate AeroKV end-to-end the way a real deployment would exercise it — wire protocol correctness, TTL expiry timing, deterministic LRU eviction, a Zipfian (hot-key) mixed read/write workload ramped across 10/50/100 concurrent clients, connection-churn latency, and a sustained soak test that checks for throughput decay over time — execute:
 
 ```bash
 cd src
-python test_all.py
+python production_suite.py
 ```
+
+Useful flags:
+
+| Flag                    | Purpose                                                        |
+| ------------------------ | --------------------------------------------------------------- |
+| `--host` / `--port`      | Target a non-default server address.                            |
+| `--soak-seconds N`       | Run the sustained load phase for `N` seconds (default: 20).     |
+| `--skip-soak`            | Skip the soak phase for a faster run during iterative development. |
+
+The suite prints pass/fail for every correctness check plus throughput and latency percentiles (p50/p95/p99) for each load phase, and exits non-zero if any correctness check fails.
 
 ## Core Features
 
