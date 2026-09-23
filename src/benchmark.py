@@ -2,62 +2,59 @@ import socket
 import time
 import threading
 
-HOST = "localhost"
-PORT = 8080
-TOTAL_REQUESTS = 1000  # Number of operations
-NUM_THREADS = 10       # Concurrent client connections
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 8080
+TOTAL_OPS = 2000
+NUM_THREADS = 10
+OPS_PER_THREAD = TOTAL_OPS // NUM_THREADS
 
-def send_command(cmd):
-    """Sends a single TCP command to AeroKV."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((HOST, PORT))
-            s.sendall((cmd + "\n").encode('utf-8'))
-            return s.recv(1024).decode('utf-8').strip()
-    except Exception as e:
-        return f"ERR:{e}"
-
-def worker_task(thread_id, requests_per_thread, results):
-    """Worker task sending SET and GET commands concurrently."""
+def worker(thread_id, results):
     success_count = 0
-    for i in range(requests_per_thread):
-        key = f"bench_key_{thread_id}_{i}"
-        val = f"value_{i}"
+    try:
+        # Har thread sirf EK baar connection banayega
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((SERVER_HOST, SERVER_PORT))
         
-        # 1. SET
-        res1 = send_command(f"SET, {key}, {val}, 60000")
-        # 2. GET
-        res2 = send_command(f"GET, {key}")
+        for i in range(OPS_PER_THREAD):
+            key = f"key_{thread_id}_{i}"
+            val = f"val_{i}"
+            # Single persistent connection se send aur receive
+            msg = f"SET,{key},{val},60000\n"
+            s.sendall(msg.encode())
+            resp = s.recv(1024).decode()
+            if "OK" in resp:
+                success_count += 1
+                
+        s.close()
+    except Exception as e:
+        print(f"Error in thread {thread_id}: {e}")
         
-        if res1 == "OK" and res2.startswith("VALUE"):
-            success_count += 2
+    results.append(success_count)
 
-    results[thread_id] = success_count
-
-if __name__ == "__main__":
-    print(f"***Starting AeroKV Load Test: {TOTAL_REQUESTS * 2} ops across {NUM_THREADS} threads...")
-    
+def run_benchmark():
+    print(f"*** Starting AeroKV Persistent Load Test: {TOTAL_OPS} ops across {NUM_THREADS} threads...")
     threads = []
-    results = {}
-    requests_per_thread = TOTAL_REQUESTS // NUM_THREADS
-
+    results = []
+    
     start_time = time.time()
-
-    for i in range(NUM_THREADS):
-        t = threading.Thread(target=worker_task, args=(i, requests_per_thread, results))
+    
+    for t_id in range(NUM_THREADS):
+        t = threading.Thread(target=worker, args=(t_id, results))
         threads.append(t)
         t.start()
-
+        
     for t in threads:
         t.join()
+        
+    total_time = time.time() - start_time
+    total_successful = sum(results)
+    ops_per_sec = total_successful / total_time
+    
+    print("-" * 50)
+    print(f"*** Load Test Completed in {total_time:.2f} seconds")
+    print(f"*** Total Successful Ops: {total_successful}")
+    print(f"*** Throughput: {ops_per_sec:.2f} ops/sec")
+    print("-" * 50)
 
-    end_time = time.time()
-    total_time = end_time - start_time
-    total_ops = sum(results.values())
-    ops_per_sec = total_ops / total_time if total_time > 0 else 0
-
-    print("--------------------------------------------------")
-    print(f"***Load Test Completed in {total_time:.2f} seconds")
-    print(f"***Total Successful Ops: {total_ops}")
-    print(f"***Throughput: {ops_per_sec:.2f} ops/sec")
-    print("--------------------------------------------------")
+if __name__ == "__main__":
+    run_benchmark()

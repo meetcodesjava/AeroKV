@@ -17,7 +17,7 @@ public class AeroLockManager {
      */
     public Object getLock(String key) {
         int hash = key.hashCode();
-        int stripeIndex = Math.abs(hash % numStripes);
+        int stripeIndex = (hash % numStripes + numStripes) % numStripes;
         return locks[stripeIndex];
     }
 }
