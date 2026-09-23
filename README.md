@@ -267,7 +267,7 @@ On startup, AeroKV scans the persisted log file and replays stored operations to
 
 ## Performance Benchmark
 
-The following benchmark was performed on a local development machine using the included multi-threaded Python benchmarking utility (`benchmark.py`). The test measures the server's ability to process concurrent `SET` and `GET` operations over TCP sockets.
+Current numbers below are from an isolated run of `production_suite.py` against a freshly started server (no other test script running against it at the same time — running multiple test scripts back-to-back on one live instance leaves behind keys and lingering sockets that skew later results, so measurements below are all from a single clean run).
 
 ### Test Environment
 
@@ -278,38 +278,77 @@ The following benchmark was performed on a local development machine using the i
 | **Storage**          | 256 GB SSD                                 |
 | **Operating System** | Windows 11                                 |
 | **Java Version**     | JDK 21.0.12                                |
-| **Benchmark Tool**   | Custom Python Multi-Threaded TCP Client    |
+| **Benchmark Tool**   | `src/production_suite.py`                  |
 
-### Benchmark Configuration
+### Simple Persistent-Connection Benchmark (`benchmark.py`)
 
-| Parameter                     | Value |
-| ----------------------------- | ----: |
-| **Concurrent Client Threads** |    10 |
-| **SET Operations**            | 1,000 |
-| **GET Operations**            | 1,000 |
-| **Total Operations**          | 2,000 |
+10 threads, each holding one persistent connection, running 2,000 total `SET` operations:
 
-### Benchmark Result
+| Metric                    |                    Result |
+| ------------------------- | -------------------------: |
+| **Execution Time**        |             ~0.08 seconds |
+| **Successful Operations** |                      2,000 |
+| **Average Throughput**    | ~24,900 operations/second |
 
-| Metric                    |                   Result |
-| ------------------------- | -----------------------: |
-| **Execution Time**        |            ~0.97 seconds |
-| **Successful Operations** |                    2,000 |
-| **Average Throughput**    | ~2,051 operations/second |
+### Mixed Zipfian Workload, Ramped Concurrency (`production_suite.py`, phase 4)
 
-> **Note:** These results were obtained in a local development environment. Actual performance may vary depending on hardware configuration, operating system, JVM settings, workload characteristics, and network conditions.
+85% reads / 15% writes, hot-key-skewed (Zipfian) access pattern over a 500-key pool, 300 ops per thread:
+
+| Concurrent Clients | Throughput (ops/sec) | Avg Latency | p50    | p95    | p99    | Errors |
+| ------------------: | ---------------------: | -----------: | ------: | ------: | ------: | ------: |
+| 10                  |                 ~24,900 |      0.193ms | 0.069ms | 0.249ms | 2.509ms |      0 |
+| 50                  |                 ~37,500 |      0.749ms | 0.087ms | 0.207ms | 2.718ms |      0 |
+| 100                 |                 ~43,700 |      1.146ms | 0.108ms | 0.285ms | 0.868ms |      0 |
+
+### Connection Churn (`production_suite.py`, phase 5)
+
+25 concurrent clients, each opening a fresh TCP connection per request (500 total connect+operate+disconnect cycles):
+
+| Metric                | Result |
+| ---------------------- | ------: |
+| **Connections/sec**   | ~3,880 |
+| **Avg Latency**       | 2.12ms |
+| **p99 Latency**       | 23.3ms |
+| **Errors**            |      0 |
+
+### Sustained Soak Test (`production_suite.py`, phase 6)
+
+20 threads, steady mixed load for 15 seconds, throughput sampled every second:
+
+| Metric                             |    Result |
+| ------------------------------------ | ---------: |
+| **Early-window avg throughput**     | ~49,300 ops/sec |
+| **Late-window avg throughput**      | ~50,800 ops/sec |
+| **Total operations**                |   747,967 |
+| **Errors**                          |        23 (0.003%) |
+
+Throughput held steady (in fact rose slightly, likely JIT warm-up) rather than degrading over the run — no sign of lock starvation or memory pressure building up under sustained load in this test.
+
+> **Note:** These results are from a local development machine and a single run each. They demonstrate the engine is fast enough for the workloads tested, not a guarantee of performance in a different environment, hardware, JVM configuration, or under adversarial/pathological workloads. Re-run `production_suite.py` yourself for numbers specific to your machine.
 
 ## Future Improvements
 
-AeroKV is a from-scratch learning project, correct and load-tested for its current feature set (see the [Production Readiness](#production-readiness) section below), but not yet hardened for real production deployment. Planned next steps, roughly in priority order:
+AeroKV is a from-scratch learning project, correct and load-tested for its current feature set (see the [Production Readiness](#production-readiness) section below), but not yet hardened for real production deployment.
 
-* **Authentication & TLS** – The server currently accepts any TCP connection with no auth and no encryption; anyone who can reach the port has full read/write/delete access to everything.
-* **Memory Bound by Size, Not Just Entry Count** – Capacity today is "N entries," not bytes; a client could still fill memory with many near-5MB values. A total-bytes budget across the cache would close this gap.
+**Genuinely needed before any real-world use** (would cause data loss, crashes, or unrestricted access — not just "nice to have"):
+
+* **Authentication** – The server currently accepts any TCP connection with no auth; anyone who can reach the port has full read/write/delete access to everything.
+* **Memory Bound by Total Size, Not Just Entry Count** – A single value is capped at 5MB, but nothing caps total cache memory; enough near-limit values can still exhaust the JVM heap.
+* **fsync on WAL Writes** – Writes are currently only `flush()`-ed to the OS buffer, not `fsync`-ed to physical disk. A power loss immediately after a client receives `OK` can still lose that write, which undermines the WAL's actual purpose.
+* **Bounded WAL Write Queue** – The async writer's queue has no capacity limit or backpressure; if writes arrive faster than disk can absorb them, the queue can grow unbounded and exhaust memory, the same failure mode as the value-size issue above.
+* **Clean Shutdown Signaling** – `stop()` currently pushes a literal `"SHUTDOWN\n"` string through the same queue used for real log data, so it gets written into the WAL file itself. Harmless today only because the recovery parser ignores unrecognized lines; should use an out-of-band signal instead.
+
+**Situational** — real for some deployments, unnecessary for others depending on where and how this actually runs:
+
+* **TLS** – Only matters if traffic crosses a network you don't fully trust; unnecessary for `localhost`-only or fully private-network use.
+* **Replication / Clustering** – Real requirement for high-availability deployments; overkill for a single-app cache or side project.
+
+**Nice-to-have, not blocking**:
+
 * **Additional Commands** – `MGET`/`MSET` for batched operations, and cache introspection commands (`STATS`, `DBSIZE`).
 * **Active TTL Cleanup** – A background sweep to proactively remove expired entries, rather than relying solely on lazy expiration at read time.
 * **TTL Persistence Across Restart** – TTLs are currently reset to "no expiry" on WAL replay/compaction; persisting remaining TTL would preserve exact expiration semantics across restarts.
 * **Observability** – Expose throughput, error rate, and WAL queue depth (e.g. via a metrics endpoint or structured logs) for use in production monitoring.
-* **Replication / Clustering** – Today it's a single process with no failover; a crashed or unreachable instance means full unavailability.
 
 ## Configuration
 
@@ -356,9 +395,9 @@ The following table summarizes the average-case time complexity of the primary o
 
 ## Production Readiness
 
-AeroKV is correctness- and load-tested for the feature set it implements today — see `src/production_suite.py`, which is run automatically on every push via [GitHub Actions](.github/workflows/ci.yml). A recent local run: 30/30 correctness checks passed, including a WAL recovery + compaction cycle that replayed 87,177 log entries and compacted the log from ~2.0 MB down to ~19 KB, and a mixed Zipfian workload sustaining ~40,000 ops/sec at p99 &lt; 1ms across 100 concurrent clients.
+AeroKV is correctness- and load-tested for the feature set it implements today — see `src/production_suite.py`, which is run automatically on every push via [GitHub Actions](.github/workflows/ci.yml). A recent isolated local run: 30/30 correctness checks passed, a WAL recovery + compaction cycle that replayed 87,177 log entries and compacted the log from ~2.0 MB down to ~19 KB, and a mixed Zipfian workload sustaining ~43,700 ops/sec at p99 ≈ 0.87ms across 100 concurrent clients (full numbers in [Performance Benchmark](#performance-benchmark)).
 
-That said, it is **not yet ready for production deployment as-is** — there is no authentication, no TLS, no replication/failover, and total memory is bounded by entry count rather than bytes. See [Future Improvements](#future-improvements) for the gap list. It's best understood as a well-tested reference implementation of the core techniques (lock striping, LRU eviction, lazy TTL, WAL + compaction), not a drop-in Redis replacement.
+That said, it is **not yet ready for production deployment as-is**. The gaps that actually matter — no authentication, memory bounded by entry count rather than total bytes, WAL writes not fsync'd to disk, and an unbounded WAL write queue — are listed first in [Future Improvements](#future-improvements), ahead of the situational and nice-to-have items. It's best understood as a well-tested reference implementation of the core techniques (lock striping, LRU eviction, lazy TTL, WAL + compaction), not a drop-in Redis replacement.
 
 ## License
 
