@@ -86,4 +86,19 @@ public class AeroConcurrentLRU {
             cache.remove(key);
         }
     }
+
+    /**
+     * Snapshot of all live (non-expired) entries as key -> raw stored value,
+     * for WAL compaction. Only safe to call while traffic is quiesced
+     * (startup/shutdown), since it does not hold every stripe lock at once.
+     */
+    public java.util.List<java.util.Map.Entry<String, Object>> snapshotLiveEntries() {
+        java.util.List<java.util.Map.Entry<String, Object>> out = new java.util.ArrayList<>();
+        for (java.util.Map.Entry<String, Object> e : cache.snapshotEntries()) {
+            CacheEntry ce = (CacheEntry) e.getValue();
+            if (ce == null || ce.isExpired()) continue;
+            out.add(java.util.Map.entry(e.getKey(), ce.value));
+        }
+        return out;
+    }
 }

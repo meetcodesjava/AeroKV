@@ -165,6 +165,26 @@ def phase_protocol_correctness(host, port, result: SuiteResult):
         resp = conn.roundtrip(f"GET,{key5}")
         result.ok("256KB payload round-trips intact") if big_val in resp else result.bad("256KB payload round-trips intact", f"len={len(resp)}")
 
+        # Oversized payload (> 5MB server-side cap) must be rejected, not
+        # silently accepted into memory.
+        oversized = "x" * (6 * 1024 * 1024)
+        key6 = f"oversized_{uuid.uuid4().hex[:8]}"
+        resp = conn.roundtrip(f"SET,{key6},{oversized},60000")
+        result.ok("oversized value rejected") if "TOO_LARGE" in resp else result.bad("oversized value rejected", resp)
+        resp = conn.roundtrip(f"GET,{key6}")
+        result.ok("rejected oversized value was not stored") if "NOT_FOUND" in resp else result.bad("rejected oversized value was not stored", resp)
+
+        # DELETE removes a key immediately
+        key7 = f"del_{uuid.uuid4().hex[:8]}"
+        conn.roundtrip(f"SET,{key7},to_be_deleted,60000")
+        resp = conn.roundtrip(f"DEL,{key7}")
+        result.ok("DEL returns OK") if resp == "OK" else result.bad("DEL returns OK", resp)
+        resp = conn.roundtrip(f"GET,{key7}")
+        result.ok("deleted key is gone") if "NOT_FOUND" in resp else result.bad("deleted key is gone", resp)
+        # Deleting an already-absent key should not error
+        resp = conn.roundtrip(f"DEL,{key7}")
+        result.ok("DEL on absent key is a safe no-op") if resp == "OK" else result.bad("DEL on absent key is a safe no-op", resp)
+
         # Pipelined commands in a single TCP write, read back with the
         # buffered client (this is the correct way to consume pipelined
         # responses — one recv() is not guaranteed to contain both lines)

@@ -96,4 +96,19 @@ public class AeroLRU {
     public int getSize() {
         return size;
     }
+
+    /**
+     * Snapshot of all live entries (key -> raw stored value), for WAL
+     * compaction. Not safe to call concurrently with writers; callers must
+     * only use this while traffic is quiesced (e.g. startup/shutdown).
+     */
+    public java.util.List<java.util.Map.Entry<String, Object>> snapshotEntries() {
+        java.util.List<java.util.Map.Entry<String, Object>> list = new java.util.ArrayList<>(size);
+        LRUNode curr = head;
+        while (curr != null) {
+            list.add(java.util.Map.entry(curr.key, curr.val));
+            curr = curr.next;
+        }
+        return list;
+    }
 }

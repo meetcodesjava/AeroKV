@@ -5,10 +5,16 @@ import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class AeroServer {
+    // Values larger than this are rejected outright rather than accepted
+    // into memory unbounded — protects the JVM heap from a single client
+    // sending an oversized payload.
+    private static final int MAX_VALUE_BYTES = 5 * 1024 * 1024; // 5 MB
+
     private final ServerSocket serverSocket;
     private final AeroConcurrentLRU cache;
     private final AeroWAL wal;
@@ -21,7 +27,13 @@ public class AeroServer {
         this.wal = new AeroWAL(logFilePath);
         this.threadPool = Executors.newFixedThreadPool(10);
         this.running = true;
+        // Order matters: recover() and compact() must both finish reading
+        // and rewriting the log file before the async writer thread opens
+        // it for append (start()), otherwise compaction can race the
+        // writer for the file handle.
         this.wal.recover(this.cache);
+        this.wal.compact(this.cache);
+        this.wal.start();
     }
 
     public void start() {
@@ -89,12 +101,25 @@ public class AeroServer {
                         val = line.substring(secondComma + 1).trim();
                     }
 
+                    if (val.getBytes(StandardCharsets.UTF_8).length > MAX_VALUE_BYTES) {
+                        out.println("ERR_VALUE_TOO_LARGE");
+                        out.flush();
+                        continue;
+                    }
+
                     AeroTTLEntry entry = new AeroTTLEntry(val, ttl);
                     cache.put(key, entry);
                     wal.logPut(key, val);
                     out.println("OK");
                     out.flush();
-                } 
+                }
+                else if ("DEL".equals(command) || "DELETE".equals(command)) {
+                    String key = line.substring(firstComma + 1).trim();
+                    cache.remove(key);
+                    wal.logDelete(key);
+                    out.println("OK");
+                    out.flush();
+                }
                 else if ("GET".equals(command)) {
                     String key = line.substring(firstComma + 1).trim();
                     Object rawEntry = cache.get(key);

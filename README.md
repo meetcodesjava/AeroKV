@@ -6,7 +6,7 @@
 
 ![Java](https://img.shields.io/badge/Java-21-blue?style=for-the-badge)
 ![Maven](https://img.shields.io/badge/Build-Maven-C71A36?style=for-the-badge)
-![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey?style=for-the-badge)
+![Platform](https://img.shields.io/badge/Platform-Cross--Platform-lightgrey?style=for-the-badge)
 ![Protocol](https://img.shields.io/badge/Protocol-TCP-success?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 
@@ -16,7 +16,7 @@
 
 AeroKV is a **high-performance, multi-threaded, in-memory key-value storage engine** developed entirely from scratch in Java. It is designed to explore the core concepts behind modern caching systems and in-memory databases by implementing essential storage engine components rather than relying on existing frameworks or libraries.
 
-The project combines **custom LRU eviction**, **segmented lock striping for concurrent access**, **lazy TTL expiration**, and **Write-Ahead Logging (WAL)** to provide fast data access while ensuring durability and crash recovery. Communication is performed over a lightweight **TCP text-based protocol**, allowing clients to interact with the server using simple `SET`, `PUT`, and `GET` commands.
+The project combines **custom LRU eviction**, **segmented lock striping for concurrent access**, **lazy TTL expiration**, and **Write-Ahead Logging (WAL) with startup compaction** to provide fast data access while ensuring durability and crash recovery. Communication is performed over a lightweight **TCP text-based protocol**, allowing clients to interact with the server using simple `SET`, `PUT`, `GET`, and `DEL` commands.
 
 AeroKV demonstrates how concurrency control, memory management, persistence, and network communication work together to build a reliable storage engine capable of serving multiple clients simultaneously.
 
@@ -43,8 +43,10 @@ By combining networking, concurrent programming, custom data structures, and per
 | **Expiration**           | Lazy Time-To-Live (TTL)                         | Removes expired entries during access without requiring a background cleanup thread                      |
 | **Persistence**          | Write-Ahead Logging (WAL)                       | Ensures durability by persisting write operations before updating the in-memory cache                    |
 | **Recovery**             | WAL Replay                                      | Restores the cache state by replaying log records during server startup                                  |
+| **Log Compaction**       | Startup WAL Rewrite                             | Rewrites the log to only the current live entries after recovery, bounding disk usage and future restart time |
 | **Storage**              | In-Memory                                       | Delivers low-latency data access by storing entries in main memory                                       |
-| **Protocol**             | TCP Text Protocol                               | Supports simple line-based `SET`, `PUT`, and `GET` commands for client interaction                       |
+| **Protocol**             | TCP Text Protocol                               | Supports simple line-based `SET`, `PUT`, `GET`, and `DEL` commands for client interaction                 |
+| **CI**                   | GitHub Actions                                  | Builds the project and runs the production readiness suite against a live server on every push/PR        |
 
 ## System Architecture
 
@@ -57,12 +59,12 @@ This separation of responsibilities keeps the storage engine modular, improves m
 | Component                 | Responsibility                                                                                                  |
 | ------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | **TCP Server**            | Accepts incoming client connections and manages request processing.                                             |
-| **Command Parser**        | Parses incoming text-based commands (`SET`, `PUT`, and `GET`) and validates request syntax.                     |
+| **Command Parser**        | Parses incoming text-based commands (`SET`, `PUT`, `GET`, `DEL`, `PING`) and validates request syntax.          |
 | **Lock Striping Layer**   | Maps keys to lock segments, allowing multiple threads to operate concurrently while minimizing lock contention. |
 | **LRU Cache Engine**      | Stores key-value pairs in memory and performs least recently used eviction when capacity limits are reached.    |
 | **TTL Manager**           | Validates the expiration time of entries during read operations and removes expired keys when accessed.         |
-| **Write-Ahead Log (WAL)** | Persists every write operation to disk before updating the in-memory cache to ensure durability.                |
-| **Recovery Engine**       | Rebuilds the cache during server startup by replaying all entries from the WAL file.                            |
+| **Write-Ahead Log (WAL)** | Persists every write and delete operation to disk before updating the in-memory cache to ensure durability.     |
+| **Recovery Engine**       | Rebuilds the cache during server startup by replaying all entries from the WAL file, then compacts the log to just the live entries. |
 
 ### Request Flow
 
@@ -237,7 +239,19 @@ Each cached entry can be assigned a configurable Time-To-Live (TTL). Expiration 
 
 ### Asynchronous Log Persistence
 
-Write operations are queued and persisted to disk by a dedicated background writer thread. During server startup, the persisted log is replayed to restore previously stored entries into the in-memory cache.
+Write and delete operations are queued and persisted to disk by a dedicated background writer thread. During server startup, the persisted log is replayed to restore previously stored entries into the in-memory cache.
+
+### WAL Compaction
+
+Immediately after recovery, and before the async writer thread reopens the log for append, AeroKV rewrites the WAL to contain only the current live entries as a single `SET` per key — discarding the accumulated history of overwrites, deletes, and expired entries. This keeps both disk usage and the next restart's replay time bounded by the cache's live size rather than growing forever with write volume.
+
+### Value Size Limit
+
+`SET`/`PUT` payloads larger than 5&nbsp;MB are rejected with `ERR_VALUE_TOO_LARGE` instead of being accepted into memory unbounded, protecting the JVM heap from a single oversized client payload.
+
+### Externalized Configuration
+
+Port, cache capacity, lock stripe count, and WAL file path are resolved from CLI arguments, then environment variables (`AEROKV_PORT`, `AEROKV_CAPACITY`, `AEROKV_STRIPES`, `AEROKV_LOG_PATH`), then built-in defaults — nothing about the deployment target is hardcoded in source, and the default WAL path is OS-portable (uses the system temp directory).
 
 ### Multi-Threaded TCP Server
 
@@ -245,7 +259,7 @@ AeroKV exposes its storage engine through a lightweight TCP server backed by a f
 
 ### Text-Based Command Protocol
 
-Clients communicate with AeroKV using a lightweight, line-delimited TCP protocol. The current implementation supports `SET` for storing data with an optional TTL and `GET` for retrieving cached values.
+Clients communicate with AeroKV using a lightweight, line-delimited TCP protocol. The current implementation supports `SET`/`PUT` for storing data with an optional TTL, `GET` for retrieving cached values, `DEL` for explicit removal, and `PING` for liveness checks.
 
 ### Crash Recovery
 
@@ -287,22 +301,39 @@ The following benchmark was performed on a local development machine using the i
 
 ## Future Improvements
 
-* **Support Additional Commands** – Extend the command protocol by adding operations such as `DELETE`, `MGET`, and `MSET`.
-* **Active TTL Cleanup** – Introduce a background cleanup thread to proactively remove expired cache entries instead of relying solely on lazy expiration.
-* **TTL Persistence** – Persist TTL metadata in the log file so that expiration information is preserved across server restarts.
+AeroKV is a from-scratch learning project, correct and load-tested for its current feature set (see the [Production Readiness](#production-readiness) section below), but not yet hardened for real production deployment. Planned next steps, roughly in priority order:
+
+* **Authentication & TLS** – The server currently accepts any TCP connection with no auth and no encryption; anyone who can reach the port has full read/write/delete access to everything.
+* **Memory Bound by Size, Not Just Entry Count** – Capacity today is "N entries," not bytes; a client could still fill memory with many near-5MB values. A total-bytes budget across the cache would close this gap.
+* **Additional Commands** – `MGET`/`MSET` for batched operations, and cache introspection commands (`STATS`, `DBSIZE`).
+* **Active TTL Cleanup** – A background sweep to proactively remove expired entries, rather than relying solely on lazy expiration at read time.
+* **TTL Persistence Across Restart** – TTLs are currently reset to "no expiry" on WAL replay/compaction; persisting remaining TTL would preserve exact expiration semantics across restarts.
+* **Observability** – Expose throughput, error rate, and WAL queue depth (e.g. via a metrics endpoint or structured logs) for use in production monitoring.
+* **Replication / Clustering** – Today it's a single process with no failover; a crashed or unreachable instance means full unavailability.
 
 ## Configuration
 
-The current implementation initializes the server using the following default configuration:
+Server configuration is resolved in this order: **CLI argument → environment variable → built-in default**. Nothing about the deployment target is hardcoded in source.
 
-| Parameter            |    Default Value | Description                                                                           |
-| -------------------- | ---------------: | ------------------------------------------------------------------------------------- |
-| **Server Port**      |           `8080` | TCP port used by the AeroKV server to accept client connections.                      |
-| **Cache Capacity**   |           `1000` | Maximum number of entries that can be stored in the in-memory LRU cache.              |
-| **Lock Stripes**     |             `16` | Number of lock segments used to reduce contention during concurrent cache operations. |
-| **Log File Path**    | `D:\AeroKV_logs` | File used to persist write operations and restore cached data during server startup.  |
-| **Thread Pool Size** |             `10` | Number of worker threads available to process concurrent client connections.          |
-| **Java Version**     |         `JDK 21` | Recommended Java version used for development and testing.                            |
+```bash
+# CLI args: port, capacity, stripes, logFilePath (all optional, positional)
+mvn exec:java -Dexec.mainClass="day06.AeroKVServerApp" -Dexec.args="9090 5000 32 /var/lib/aerokv/wal.log"
+
+# or via environment variables
+AEROKV_PORT=9090 AEROKV_CAPACITY=5000 AEROKV_STRIPES=32 AEROKV_LOG_PATH=/var/lib/aerokv/wal.log \
+  mvn exec:java -Dexec.mainClass="day06.AeroKVServerApp"
+```
+
+| Parameter             | Env Var             | Default Value                          | Description                                                                            |
+| ---------------------- | -------------------- | --------------------------------------- | ---------------------------------------------------------------------------------------- |
+| **Server Port**        | `AEROKV_PORT`         | `8080`                                  | TCP port used by the AeroKV server to accept client connections.                        |
+| **Cache Capacity**     | `AEROKV_CAPACITY`     | `1000`                                  | Maximum number of entries that can be stored in the in-memory LRU cache.                |
+| **Lock Stripes**       | `AEROKV_STRIPES`      | `16`                                    | Number of lock segments used to reduce contention during concurrent cache operations.   |
+| **Log File Path**      | `AEROKV_LOG_PATH`     | `<system temp dir>/aerokv.log`          | File used to persist write/delete operations and restore cached data during startup.    |
+| **Max Value Size**     | *(not configurable)* | `5 MB`                                  | `SET`/`PUT` payloads larger than this are rejected with `ERR_VALUE_TOO_LARGE`.          |
+| **Thread Pool Size**   | *(not configurable)* | `10`                                    | Number of worker threads available to process concurrent client connections.            |
+| **Idle Socket Timeout**| *(not configurable)* | `1000 ms`                               | A connection idle longer than this is closed to free its worker thread back to the pool.|
+| **Java Version**       | —                     | `JDK 21`                                | Recommended Java version used for development and testing.                              |
 
 
 ## Time Complexity
@@ -322,6 +353,16 @@ The following table summarizes the average-case time complexity of the primary o
 | **Log Queue Insertion**       |                  `O(1)` |
 
 > **Note:** The above complexities represent the average case. HashMap operations may degrade in the presence of excessive hash collisions, while log persistence time depends on the underlying storage device and operating system.
+
+## Production Readiness
+
+AeroKV is correctness- and load-tested for the feature set it implements today — see `src/production_suite.py`, which is run automatically on every push via [GitHub Actions](.github/workflows/ci.yml). A recent local run: 30/30 correctness checks passed, including a WAL recovery + compaction cycle that replayed 87,177 log entries and compacted the log from ~2.0 MB down to ~19 KB, and a mixed Zipfian workload sustaining ~40,000 ops/sec at p99 &lt; 1ms across 100 concurrent clients.
+
+That said, it is **not yet ready for production deployment as-is** — there is no authentication, no TLS, no replication/failover, and total memory is bounded by entry count rather than bytes. See [Future Improvements](#future-improvements) for the gap list. It's best understood as a well-tested reference implementation of the core techniques (lock striping, LRU eviction, lazy TTL, WAL + compaction), not a drop-in Redis replacement.
+
+## License
+
+AeroKV is released under the [MIT License](LICENSE). You're free to use, modify, and distribute it (including commercially), provided the original copyright notice is retained.
 
 ## Author
 
