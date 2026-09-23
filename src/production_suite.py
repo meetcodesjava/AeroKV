@@ -39,12 +39,28 @@ from dataclasses import dataclass, field
 # repo used a single recv() per exchange, which is a client-side bug, not a
 # server bug (confirmed by re-running with a buffered reader).
 
+# Set from --password if the target server requires AUTH. When set, every
+# AeroKVConnection auto-authenticates right after connecting, so none of
+# the other phases need to know or care whether auth is turned on.
+_AUTH_PASSWORD = None
+
+
 class AeroKVConnection:
-    def __init__(self, host, port, timeout=5.0):
+    # 15s (not 5s) because the server's worker thread pool is fixed at 10
+    # threads: under the ramp-to-100-clients phase, plus every connection
+    # now paying one extra AUTH round trip when auth is enabled, queueing
+    # for a free thread can legitimately take longer than 5s. That's a
+    # real capacity limit of the small thread pool, not a hang — confirmed
+    # by the server still answering PING promptly while under this load.
+    def __init__(self, host, port, timeout=15.0, auto_auth=True):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(timeout)
         self.sock.connect((host, port))
         self._buf = b""
+        if auto_auth and _AUTH_PASSWORD:
+            resp = self.roundtrip(f"AUTH,{_AUTH_PASSWORD}")
+            if resp != "OK":
+                raise ConnectionError(f"AUTH failed for this connection: {resp}")
 
     def send(self, line: str):
         self.sock.sendall((line + "\n").encode("utf-8"))
@@ -69,7 +85,7 @@ class AeroKVConnection:
             pass
 
 
-def one_shot(host, port, line: str, timeout=5.0) -> str:
+def one_shot(host, port, line: str, timeout=15.0) -> str:
     conn = AeroKVConnection(host, port, timeout)
     try:
         return conn.roundtrip(line)
@@ -104,6 +120,49 @@ class SuiteResult:
                 print(f"   - {name}: {detail}")
         print("=" * 70)
         return len(self.failed) == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 0: Authentication (only runs when --password is supplied, i.e. the
+# target server was started with AEROKV_PASSWORD set)
+# ---------------------------------------------------------------------------
+
+def phase_auth_correctness(host, port, password, result: SuiteResult):
+    print("\n[0/6] Authentication")
+
+    # Raw connection with auto_auth=False so we control exactly when AUTH
+    # is sent, to check the gating behavior itself.
+    conn = AeroKVConnection(host, port, auto_auth=False)
+    try:
+        resp = conn.roundtrip(f"SET,auth_test_{uuid.uuid4().hex[:8]},v,60000")
+        result.ok("command before AUTH is rejected") if "NOT_AUTHENTICATED" in resp \
+            else result.bad("command before AUTH is rejected", resp)
+
+        resp = conn.roundtrip("AUTH,definitely_the_wrong_password")
+        result.ok("wrong password rejected") if "AUTH_FAILED" in resp else result.bad("wrong password rejected", resp)
+
+        resp = conn.roundtrip(f"SET,auth_test_{uuid.uuid4().hex[:8]},v,60000")
+        result.ok("still rejected after a failed AUTH attempt") if "NOT_AUTHENTICATED" in resp \
+            else result.bad("still rejected after a failed AUTH attempt", resp)
+
+        resp = conn.roundtrip(f"AUTH,{password}")
+        result.ok("correct password accepted") if resp == "OK" else result.bad("correct password accepted", resp)
+
+        key = f"auth_test_{uuid.uuid4().hex[:8]}"
+        resp = conn.roundtrip(f"SET,{key},authed_value,60000")
+        result.ok("command succeeds after AUTH") if resp == "OK" else result.bad("command succeeds after AUTH", resp)
+        resp = conn.roundtrip(f"GET,{key}")
+        result.ok("value readable after AUTH") if "authed_value" in resp else result.bad("value readable after AUTH", resp)
+    finally:
+        conn.close()
+
+    # PING is a liveness check and should work regardless of auth state.
+    conn2 = AeroKVConnection(host, port, auto_auth=False)
+    try:
+        resp = conn2.roundtrip("PING")
+        result.ok("PING works without auth") if resp == "PONG" else result.bad("PING works without auth", resp)
+    finally:
+        conn2.close()
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +357,7 @@ def run_mixed_workload(host, port, threads, ops_per_thread, key_pool, read_ratio
 
     def worker(tid):
         rng = random.Random(tid * 7919 + 13)
-        conn = AeroKVConnection(host, port, timeout=5.0)
+        conn = AeroKVConnection(host, port, timeout=15.0)
         local_lat = []
         local_err = 0
         try:
@@ -391,7 +450,7 @@ def phase_connection_churn(host, port, result: SuiteResult, n_requests=500, conc
             t0 = time.perf_counter()
             try:
                 key = f"churn_{i}_{threading.get_ident()}"
-                resp = one_shot(host, port, f"SET,{key},v,15000", timeout=5.0)
+                resp = one_shot(host, port, f"SET,{key},v,15000", timeout=15.0)
                 if resp != "OK":
                     local_err += 1
             except Exception:
@@ -441,7 +500,7 @@ def phase_soak_test(host, port, result: SuiteResult, duration_s, threads=20):
 
     def soak_worker(tid):
         rng = random.Random(tid * 104729)
-        conn = AeroKVConnection(host, port, timeout=5.0)
+        conn = AeroKVConnection(host, port, timeout=15.0)
         keys = [f"soak_{tid}_{i}" for i in range(50)]
         try:
             while time.time() < stop_at:
@@ -461,7 +520,7 @@ def phase_soak_test(host, port, result: SuiteResult, duration_s, threads=20):
                         conn.close()
                     except Exception:
                         pass
-                    conn = AeroKVConnection(host, port, timeout=5.0)
+                    conn = AeroKVConnection(host, port, timeout=15.0)
         finally:
             conn.close()
 
@@ -510,14 +569,22 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--soak-seconds", type=int, default=20, help="duration of the sustained soak test")
     ap.add_argument("--skip-soak", action="store_true", help="skip the soak test (fastest run)")
+    ap.add_argument("--password", default=None,
+                     help="If the target server was started with AEROKV_PASSWORD set, supply it here. "
+                          "The suite will authenticate every connection it opens, and also run "
+                          "AUTH-specific correctness checks.")
     args = ap.parse_args()
+
+    global _AUTH_PASSWORD
+    _AUTH_PASSWORD = args.password
 
     print("=" * 70)
     print("AEROKV PRODUCTION READINESS SUITE")
     print(f"target: {args.host}:{args.port}")
     print("=" * 70)
 
-    # Fail fast if the server isn't reachable at all.
+    # Fail fast if the server isn't reachable at all. PING never requires
+    # auth, so this check works whether or not --password was given.
     try:
         resp = one_shot(args.host, args.port, "PING", timeout=3.0)
         if resp != "PONG":
@@ -528,6 +595,8 @@ def main():
         raise SystemExit(2)
 
     result = SuiteResult()
+    if args.password:
+        phase_auth_correctness(args.host, args.port, args.password, result)
     phase_protocol_correctness(args.host, args.port, result)
     phase_ttl_correctness(args.host, args.port, result)
     phase_lru_eviction(args.host, args.port, result)

@@ -97,6 +97,27 @@ public class AeroLRU {
         return size;
     }
 
+    public int getCapacity() {
+        return capacity;
+    }
+
+    /**
+     * Key of the current least-recently-used entry, without changing order.
+     * Used by the byte-budget eviction in AeroConcurrentLRU. Returns null
+     * if the cache is empty.
+     */
+    public String peekTailKey() {
+        return tail != null ? tail.key : null;
+    }
+
+    /**
+     * Value of the current least-recently-used entry, without changing
+     * order. Used by the byte-budget eviction in AeroConcurrentLRU.
+     */
+    public Object peekTailValue() {
+        return tail != null ? tail.val : null;
+    }
+
     /**
      * Snapshot of all live entries (key -> raw stored value), for WAL
      * compaction. Not safe to call concurrently with writers; callers must

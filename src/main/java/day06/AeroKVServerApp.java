@@ -13,12 +13,34 @@ public class AeroKVServerApp {
         int cacheCapacity = intConfig(arg(args, 1), "AEROKV_CAPACITY", 1000);
         int lockStripes = intConfig(arg(args, 2), "AEROKV_STRIPES", 16);
         String logFilePath = strConfig(arg(args, 3), "AEROKV_LOG_PATH", defaultLogPath());
+        // Total memory budget across all cached values, in bytes. 0 means
+        // "no limit" (only the entry-count capacity above applies).
+        long maxTotalBytes = longConfig(arg(args, 4), "AEROKV_MAX_MEMORY_BYTES", 256L * 1024 * 1024);
+        // No default password: auth is off unless explicitly configured.
+        String password = strConfig(arg(args, 5), "AEROKV_PASSWORD", null);
+        int threadPoolSize = intConfig(arg(args, 6), "AEROKV_THREADS", 200);
 
         System.out.println("Starting AeroKV with port=" + port + ", capacity=" + cacheCapacity
-                + ", stripes=" + lockStripes + ", logFilePath=" + logFilePath);
+                + ", stripes=" + lockStripes + ", logFilePath=" + logFilePath
+                + ", maxTotalBytes=" + maxTotalBytes
+                + ", authRequired=" + (password != null && !password.isBlank())
+                + ", threadPoolSize=" + threadPoolSize);
 
         try {
-            AeroServer server = new AeroServer(port, cacheCapacity, lockStripes, logFilePath);
+            AeroServer server = new AeroServer(port, cacheCapacity, lockStripes, logFilePath, maxTotalBytes, password, threadPoolSize);
+            // Without this, stop() is never called: Ctrl+C or a normal
+            // process-kill would just end the JVM outright, dropping any
+            // writes still sitting in the WAL queue and skipping the
+            // graceful writer-thread drain that stop()/AeroWAL.shutdown()
+            // are meant to do.
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try {
+                    System.out.println("Shutting down AeroKV...");
+                    server.stop();
+                } catch (Exception e) {
+                    System.err.println("Error during shutdown: " + e.getMessage());
+                }
+            }));
             server.start();
         } catch (Exception e) {
             System.err.println("Failed to start AeroKV server: " + e.getMessage());
@@ -47,5 +69,16 @@ public class AeroKVServerApp {
     private static String strConfig(String argValue, String envVar, String fallback) {
         String raw = argValue != null ? argValue : System.getenv(envVar);
         return (raw == null || raw.isBlank()) ? fallback : raw.trim();
+    }
+
+    private static long longConfig(String argValue, String envVar, long fallback) {
+        String raw = argValue != null ? argValue : System.getenv(envVar);
+        if (raw == null || raw.isBlank()) return fallback;
+        try {
+            return Long.parseLong(raw.trim());
+        } catch (NumberFormatException e) {
+            System.err.println("Invalid value for " + envVar + " (\"" + raw + "\"), using default " + fallback);
+            return fallback;
+        }
     }
 }

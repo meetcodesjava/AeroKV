@@ -16,7 +16,7 @@
 
 AeroKV is a **high-performance, multi-threaded, in-memory key-value storage engine** developed entirely from scratch in Java. It is designed to explore the core concepts behind modern caching systems and in-memory databases by implementing essential storage engine components rather than relying on existing frameworks or libraries.
 
-The project combines **custom LRU eviction**, **segmented lock striping for concurrent access**, **lazy TTL expiration**, and **Write-Ahead Logging (WAL) with startup compaction** to provide fast data access while ensuring durability and crash recovery. Communication is performed over a lightweight **TCP text-based protocol**, allowing clients to interact with the server using simple `SET`, `PUT`, `GET`, and `DEL` commands.
+The project combines **custom LRU eviction**, **segmented lock striping for concurrent access**, **lazy TTL expiration**, **optional password authentication**, and **Write-Ahead Logging (WAL) with startup compaction and fsync'd durability** to provide fast data access while ensuring durability and crash recovery. Communication is performed over a lightweight **TCP text-based protocol**, allowing clients to interact with the server using simple `SET`, `PUT`, `GET`, `DEL`, and `AUTH` commands.
 
 AeroKV demonstrates how concurrency control, memory management, persistence, and network communication work together to build a reliable storage engine capable of serving multiple clients simultaneously.
 
@@ -243,23 +243,35 @@ Write and delete operations are queued and persisted to disk by a dedicated back
 
 ### WAL Compaction
 
-Immediately after recovery, and before the async writer thread reopens the log for append, AeroKV rewrites the WAL to contain only the current live entries as a single `SET` per key — discarding the accumulated history of overwrites, deletes, and expired entries. This keeps both disk usage and the next restart's replay time bounded by the cache's live size rather than growing forever with write volume.
+Immediately after recovery, and before the async writer thread reopens the log for append, AeroKV rewrites the WAL to contain only the current live entries as a single `SET` per key — discarding the accumulated history of overwrites, deletes, and expired entries. This keeps both disk usage and the next restart's replay time bounded by the cache's live size rather than growing forever with write volume. (Verified: a log that grew to 87,177 entries / ~2.0MB compacted down to 1,000 live entries / ~19KB on restart.)
+
+### Durable, Backpressured WAL Writes
+
+Every write is fsync'd (`FileDescriptor.sync()`) to physical disk, not just flushed to the OS buffer, so a completed write really survives a crash immediately after the client receives `OK`. Concurrent writes are grouped into a single flush+fsync per batch ("group commit") so durability doesn't come at the cost of one disk sync per individual write. The write queue itself is capped (10,000 entries); once full, a writing client blocks until there's room instead of the queue growing without limit.
+
+### Password Authentication (Optional)
+
+If `AEROKV_PASSWORD` is set, every connection must send `AUTH,<password>` before any other command is accepted — `PING` remains open for liveness checks. If no password is configured, the server behaves exactly as before (open access), so this is opt-in.
 
 ### Value Size Limit
 
 `SET`/`PUT` payloads larger than 5&nbsp;MB are rejected with `ERR_VALUE_TOO_LARGE` instead of being accepted into memory unbounded, protecting the JVM heap from a single oversized client payload.
 
+### Total Memory Budget
+
+Beyond the per-value 5MB cap and the entry-count capacity, AeroKV can also enforce a total-bytes budget across the whole cache (default 256MB, configurable). When a new value would push total memory over budget, the least-recently-used entries are evicted first — the same policy already used for count-based eviction, just also triggered by total size.
+
 ### Externalized Configuration
 
-Port, cache capacity, lock stripe count, and WAL file path are resolved from CLI arguments, then environment variables (`AEROKV_PORT`, `AEROKV_CAPACITY`, `AEROKV_STRIPES`, `AEROKV_LOG_PATH`), then built-in defaults — nothing about the deployment target is hardcoded in source, and the default WAL path is OS-portable (uses the system temp directory).
+Port, cache capacity, lock stripe count, WAL file path, memory budget, password, and thread pool size are all resolved from CLI arguments, then environment variables, then built-in defaults — nothing about the deployment target is hardcoded in source, and the default WAL path is OS-portable (uses the system temp directory).
 
 ### Multi-Threaded TCP Server
 
-AeroKV exposes its storage engine through a lightweight TCP server backed by a fixed-size thread pool. This enables multiple clients to perform concurrent cache operations using a simple text-based protocol.
+AeroKV exposes its storage engine through a lightweight TCP server backed by a fixed-size thread pool, where one thread stays attached to a connection for that connection's entire lifetime. This means the thread pool size is a real ceiling on concurrent connections, not just a performance knob — size it at least as large as the number of clients you expect connected at once (default 200, configurable via `AEROKV_THREADS`).
 
 ### Text-Based Command Protocol
 
-Clients communicate with AeroKV using a lightweight, line-delimited TCP protocol. The current implementation supports `SET`/`PUT` for storing data with an optional TTL, `GET` for retrieving cached values, `DEL` for explicit removal, and `PING` for liveness checks.
+Clients communicate with AeroKV using a lightweight, line-delimited TCP protocol. The current implementation supports `SET`/`PUT` for storing data with an optional TTL, `GET` for retrieving cached values, `DEL` for explicit removal, `AUTH` for authenticating when a password is configured, and `PING` for liveness checks.
 
 ### Crash Recovery
 
@@ -288,7 +300,7 @@ Current numbers below are from an isolated run of `production_suite.py` against 
 | ------------------------- | -------------------------: |
 | **Execution Time**        |             ~0.08 seconds |
 | **Successful Operations** |                      2,000 |
-| **Average Throughput**    | ~24,900 operations/second |
+| **Average Throughput**    | ~24,600 operations/second |
 
 ### Mixed Zipfian Workload, Ramped Concurrency (`production_suite.py`, phase 4)
 
@@ -296,9 +308,12 @@ Current numbers below are from an isolated run of `production_suite.py` against 
 
 | Concurrent Clients | Throughput (ops/sec) | Avg Latency | p50    | p95    | p99    | Errors |
 | ------------------: | ---------------------: | -----------: | ------: | ------: | ------: | ------: |
-| 10                  |                 ~24,900 |      0.193ms | 0.069ms | 0.249ms | 2.509ms |      0 |
-| 50                  |                 ~37,500 |      0.749ms | 0.087ms | 0.207ms | 2.718ms |      0 |
-| 100                 |                 ~43,700 |      1.146ms | 0.108ms | 0.285ms | 0.868ms |      0 |
+| 10                  |                 ~28,000 |      0.186ms | 0.065ms | 0.161ms | 1.532ms |      0 |
+| 50                  |                 ~39,600 |      0.660ms | 0.095ms | 0.324ms | 20.1ms  |      0 |
+| 100                 |                 ~46,900 |      1.132ms | 0.179ms | 0.568ms | 27.5ms  |      0 |
+| 100 (with `AUTH`)   |                 ~45,600 |      1.249ms | 0.178ms | 2.119ms | 9.1ms   |      0 |
+
+(The higher p99 at 50/100 clients vs. an earlier run reflects real per-connection queueing on this machine, not errors — every operation still succeeded.)
 
 ### Connection Churn (`production_suite.py`, phase 5)
 
@@ -306,9 +321,9 @@ Current numbers below are from an isolated run of `production_suite.py` against 
 
 | Metric                | Result |
 | ---------------------- | ------: |
-| **Connections/sec**   | ~3,880 |
-| **Avg Latency**       | 2.12ms |
-| **p99 Latency**       | 23.3ms |
+| **Connections/sec**   | ~4,490 |
+| **Avg Latency**       | 1.90ms |
+| **p99 Latency**       | 19.6ms |
 | **Errors**            |      0 |
 
 ### Sustained Soak Test (`production_suite.py`, phase 6)
@@ -317,12 +332,12 @@ Current numbers below are from an isolated run of `production_suite.py` against 
 
 | Metric                             |    Result |
 | ------------------------------------ | ---------: |
-| **Early-window avg throughput**     | ~49,300 ops/sec |
-| **Late-window avg throughput**      | ~50,800 ops/sec |
-| **Total operations**                |   747,967 |
-| **Errors**                          |        23 (0.003%) |
+| **Early-window avg throughput**     | ~50,000 ops/sec |
+| **Late-window avg throughput**      | ~50,500 ops/sec |
+| **Total operations**                |   753,476 |
+| **Errors**                          |        0 |
 
-Throughput held steady (in fact rose slightly, likely JIT warm-up) rather than degrading over the run — no sign of lock starvation or memory pressure building up under sustained load in this test.
+Throughput held steady (in fact rose slightly, likely JIT warm-up) rather than degrading over the run, with zero errors — no sign of lock starvation, memory pressure, or connection drops under sustained load in this test. (An earlier version of this run showed 10-30 errors here; those were traced to the idle-socket-timeout bug described in [Future Improvements](#future-improvements) and are gone after that fix.)
 
 > **Note:** These results are from a local development machine and a single run each. They demonstrate the engine is fast enough for the workloads tested, not a guarantee of performance in a different environment, hardware, JVM configuration, or under adversarial/pathological workloads. Re-run `production_suite.py` yourself for numbers specific to your machine.
 
@@ -330,13 +345,14 @@ Throughput held steady (in fact rose slightly, likely JIT warm-up) rather than d
 
 AeroKV is a from-scratch learning project, correct and load-tested for its current feature set (see the [Production Readiness](#production-readiness) section below), but not yet hardened for real production deployment.
 
-**Genuinely needed before any real-world use** (would cause data loss, crashes, or unrestricted access — not just "nice to have"):
+**Already fixed** (previously listed here as gaps; kept for anyone comparing against an older version of this README):
 
-* **Authentication** – The server currently accepts any TCP connection with no auth; anyone who can reach the port has full read/write/delete access to everything.
-* **Memory Bound by Total Size, Not Just Entry Count** – A single value is capped at 5MB, but nothing caps total cache memory; enough near-limit values can still exhaust the JVM heap.
-* **fsync on WAL Writes** – Writes are currently only `flush()`-ed to the OS buffer, not `fsync`-ed to physical disk. A power loss immediately after a client receives `OK` can still lose that write, which undermines the WAL's actual purpose.
-* **Bounded WAL Write Queue** – The async writer's queue has no capacity limit or backpressure; if writes arrive faster than disk can absorb them, the queue can grow unbounded and exhaust memory, the same failure mode as the value-size issue above.
-* **Clean Shutdown Signaling** – `stop()` currently pushes a literal `"SHUTDOWN\n"` string through the same queue used for real log data, so it gets written into the WAL file itself. Harmless today only because the recovery parser ignores unrecognized lines; should use an out-of-band signal instead.
+* ~~Authentication~~ — optional `AUTH`/`AEROKV_PASSWORD` support added.
+* ~~Memory bound by total size~~ — total-byte budget with LRU eviction added (`AEROKV_MAX_MEMORY_BYTES`).
+* ~~fsync on WAL writes~~ — writes are now fsync'd to physical disk (batched via group commit).
+* ~~Bounded WAL write queue~~ — the write queue is now capped, with backpressure instead of unbounded growth.
+* ~~Shutdown sentinel written into the log~~ — replaced with an out-of-band signal; `stop()` is now actually wired to a JVM shutdown hook (previously it was never called at all).
+* ~~Idle-socket timeout too aggressive~~ — found while testing the auth feature under load: the original 1-second idle timeout combined with a fixed 10-thread pool could kill a client's connection mid-wait under realistic concurrency, well before the client had done anything wrong. Raised to 60s and made the thread pool size configurable (default 200; this server pins one thread per connection for its lifetime, so pool size is a hard concurrency ceiling, not just a tuning knob).
 
 **Situational** — real for some deployments, unnecessary for others depending on where and how this actually runs:
 
@@ -349,30 +365,36 @@ AeroKV is a from-scratch learning project, correct and load-tested for its curre
 * **Active TTL Cleanup** – A background sweep to proactively remove expired entries, rather than relying solely on lazy expiration at read time.
 * **TTL Persistence Across Restart** – TTLs are currently reset to "no expiry" on WAL replay/compaction; persisting remaining TTL would preserve exact expiration semantics across restarts.
 * **Observability** – Expose throughput, error rate, and WAL queue depth (e.g. via a metrics endpoint or structured logs) for use in production monitoring.
+* **Event-Driven I/O** – The server is thread-per-connection (one OS thread pinned per live connection); an NIO/event-loop design would remove the thread-pool-size-as-concurrency-ceiling constraint entirely instead of just raising the ceiling.
 
 ## Configuration
 
 Server configuration is resolved in this order: **CLI argument → environment variable → built-in default**. Nothing about the deployment target is hardcoded in source.
 
 ```bash
-# CLI args: port, capacity, stripes, logFilePath (all optional, positional)
-mvn exec:java -Dexec.mainClass="day06.AeroKVServerApp" -Dexec.args="9090 5000 32 /var/lib/aerokv/wal.log"
+# CLI args, positional and all optional:
+# port capacity stripes logFilePath maxMemoryBytes password threads
+mvn exec:java -Dexec.mainClass="day06.AeroKVServerApp" \
+  -Dexec.args="9090 5000 32 /var/lib/aerokv/wal.log 536870912 mySecret 200"
 
 # or via environment variables
 AEROKV_PORT=9090 AEROKV_CAPACITY=5000 AEROKV_STRIPES=32 AEROKV_LOG_PATH=/var/lib/aerokv/wal.log \
+AEROKV_MAX_MEMORY_BYTES=536870912 AEROKV_PASSWORD=mySecret AEROKV_THREADS=200 \
   mvn exec:java -Dexec.mainClass="day06.AeroKVServerApp"
 ```
 
-| Parameter             | Env Var             | Default Value                          | Description                                                                            |
-| ---------------------- | -------------------- | --------------------------------------- | ---------------------------------------------------------------------------------------- |
-| **Server Port**        | `AEROKV_PORT`         | `8080`                                  | TCP port used by the AeroKV server to accept client connections.                        |
-| **Cache Capacity**     | `AEROKV_CAPACITY`     | `1000`                                  | Maximum number of entries that can be stored in the in-memory LRU cache.                |
-| **Lock Stripes**       | `AEROKV_STRIPES`      | `16`                                    | Number of lock segments used to reduce contention during concurrent cache operations.   |
-| **Log File Path**      | `AEROKV_LOG_PATH`     | `<system temp dir>/aerokv.log`          | File used to persist write/delete operations and restore cached data during startup.    |
-| **Max Value Size**     | *(not configurable)* | `5 MB`                                  | `SET`/`PUT` payloads larger than this are rejected with `ERR_VALUE_TOO_LARGE`.          |
-| **Thread Pool Size**   | *(not configurable)* | `10`                                    | Number of worker threads available to process concurrent client connections.            |
-| **Idle Socket Timeout**| *(not configurable)* | `1000 ms`                               | A connection idle longer than this is closed to free its worker thread back to the pool.|
-| **Java Version**       | —                     | `JDK 21`                                | Recommended Java version used for development and testing.                              |
+| Parameter               | Env Var                    | Default Value                   | Description                                                                                  |
+| ------------------------- | ---------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------ |
+| **Server Port**          | `AEROKV_PORT`                | `8080`                            | TCP port used by the AeroKV server to accept client connections.                              |
+| **Cache Capacity**       | `AEROKV_CAPACITY`            | `1000`                            | Maximum number of entries that can be stored in the in-memory LRU cache.                      |
+| **Lock Stripes**         | `AEROKV_STRIPES`             | `16`                               | Number of lock segments used to reduce contention during concurrent cache operations.         |
+| **Log File Path**        | `AEROKV_LOG_PATH`            | `<system temp dir>/aerokv.log`    | File used to persist write/delete operations and restore cached data during startup.          |
+| **Max Total Memory**     | `AEROKV_MAX_MEMORY_BYTES`    | `268435456` (256MB)                | Total byte budget across all cached values; least-recently-used entries are evicted to stay under it. `0` disables the check. |
+| **Password**             | `AEROKV_PASSWORD`            | *(unset — auth disabled)*         | If set, every connection must send `AUTH,<password>` before any other command.                |
+| **Thread Pool Size**     | `AEROKV_THREADS`             | `200`                              | Worker threads available to process client connections. One thread is pinned per connection for its whole lifetime, so this is a hard ceiling on concurrent connections, not just a tuning knob. |
+| **Max Value Size**       | *(not configurable)*         | `5 MB`                             | `SET`/`PUT` payloads larger than this are rejected with `ERR_VALUE_TOO_LARGE`.                |
+| **Idle Socket Timeout**  | *(not configurable)*         | `60,000 ms`                        | A connection idle longer than this is closed to free its worker thread back to the pool.      |
+| **Java Version**         | —                             | `JDK 21`                           | Recommended Java version used for development and testing.                                    |
 
 
 ## Time Complexity
@@ -395,9 +417,9 @@ The following table summarizes the average-case time complexity of the primary o
 
 ## Production Readiness
 
-AeroKV is correctness- and load-tested for the feature set it implements today — see `src/production_suite.py`, which is run automatically on every push via [GitHub Actions](.github/workflows/ci.yml). A recent isolated local run: 30/30 correctness checks passed, a WAL recovery + compaction cycle that replayed 87,177 log entries and compacted the log from ~2.0 MB down to ~19 KB, and a mixed Zipfian workload sustaining ~43,700 ops/sec at p99 ≈ 0.87ms across 100 concurrent clients (full numbers in [Performance Benchmark](#performance-benchmark)).
+AeroKV is correctness- and load-tested for the feature set it implements today — see `src/production_suite.py`, which is run automatically on every push via [GitHub Actions](.github/workflows/ci.yml). Recent isolated local runs: 30/30 correctness checks passed with auth disabled, 37/37 passed with `AEROKV_PASSWORD` set (7 extra AUTH-specific checks), a WAL recovery + compaction cycle that replayed 87,177 log entries and compacted the log from ~2.0 MB down to ~19 KB, and a mixed Zipfian workload sustaining ~45,600 ops/sec at 100 concurrent authenticated clients with zero errors (full numbers in [Performance Benchmark](#performance-benchmark)).
 
-That said, it is **not yet ready for production deployment as-is**. The gaps that actually matter — no authentication, memory bounded by entry count rather than total bytes, WAL writes not fsync'd to disk, and an unbounded WAL write queue — are listed first in [Future Improvements](#future-improvements), ahead of the situational and nice-to-have items. It's best understood as a well-tested reference implementation of the core techniques (lock striping, LRU eviction, lazy TTL, WAL + compaction), not a drop-in Redis replacement.
+That said, it is **not yet ready for production deployment as-is**. The gaps that still matter — TLS, replication/failover, and a few nice-to-have protocol/observability features — are listed in [Future Improvements](#future-improvements). The previously-listed critical gaps (no auth, memory bounded only by entry count, WAL writes not fsync'd, unbounded write queue, and an idle-timeout/thread-pool bug found while fixing those) have been addressed and verified under load. It's best understood as a well-tested reference implementation of the core techniques (lock striping, LRU eviction, lazy TTL, WAL + compaction, auth, memory budgeting), not a drop-in Redis replacement — it still lacks TLS and multi-node replication.
 
 ## License
 

@@ -32,4 +32,12 @@ public class AeroTTLEntry {
     public long getTtlMillis(){
         return ttlMillis;
     }
+
+    // Without this, code that measures entries by their default toString()
+    // (e.g. AeroConcurrentLRU's byte-budget accounting) sees the wrapper
+    // object's identity string instead of the actual stored content.
+    @Override
+    public String toString(){
+        return String.valueOf(value);
+    }
 }

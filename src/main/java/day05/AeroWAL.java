@@ -1,23 +1,37 @@
 package day05;
 
 import day04.AeroConcurrentLRU;
-import java.io.BufferedWriter;
-import java.io.FileWriter;
 import java.io.BufferedReader;
-import java.io.FileReader;
+import java.io.BufferedWriter;
 import java.io.File;
+import java.io.FileReader;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.LinkedBlockingQueue;
 
 public class AeroWAL {
-    private final LinkedBlockingQueue<String> logQueue;
+    // Caps how many pending writes can queue up waiting for disk, so a
+    // sustained burst can't grow the queue (and JVM memory) without limit.
+    // Once full, logPut/logDelete block the calling client thread until
+    // there is room — natural backpressure instead of unbounded growth.
+    private static final int MAX_QUEUE_CAPACITY = 10_000;
+
+    // Sentinel object (not text) used to tell the writer thread to stop.
+    // Identity-compared, never written to the log file, unlike the old
+    // approach of pushing a literal "SHUTDOWN\n" string through the same
+    // queue used for real data.
+    private static final Object SHUTDOWN_SIGNAL = new Object();
+
+    private final LinkedBlockingQueue<Object> logQueue;
     private final String logFilePath;
     private Thread writerThread;
     private volatile boolean running;
 
     public AeroWAL(String logFilePath){
         this.logFilePath=logFilePath;
-        this.logQueue=new LinkedBlockingQueue<>();
+        this.logQueue=new LinkedBlockingQueue<>(MAX_QUEUE_CAPACITY);
         this.running=true;
         // Writer thread is NOT started here: it must not open the log file
         // for append until after recover()/compact() have finished reading
@@ -89,7 +103,7 @@ public class AeroWAL {
         long before = logFile.length();
         int written = 0;
 
-        try(BufferedWriter writer=new BufferedWriter(new FileWriter(tmpFile, false))){
+        try(BufferedWriter writer=new BufferedWriter(new java.io.FileWriter(tmpFile, false))){
             for(java.util.Map.Entry<String, Object> e : cache.snapshotLiveEntries()){
                 Object rawVal = e.getValue();
                 String val = (rawVal instanceof AeroTTLEntry)
@@ -117,26 +131,58 @@ public class AeroWAL {
 
 
     public void logPut(String key, Object value){
-        if(!running) return;
-
-        String logLine="SET," + key + "," + value + "\n";
-        logQueue.offer(logLine);
+        enqueue("SET," + key + "," + value + "\n");
     }
 
     public void logDelete(String key){
-        if(!running) return;
+        enqueue("DEL," + key + "\n");
+    }
 
-        String logLine="DEL," + key + "\n";
-        logQueue.offer(logLine);
+    /**
+     * Blocks the calling (client-handling) thread if the queue is full,
+     * instead of growing it without bound. This is deliberate backpressure:
+     * a write only returns once there is room to queue it for durable
+     * persistence.
+     */
+    private void enqueue(String logLine){
+        if(!running) return;
+        try {
+            logQueue.put(logLine);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
 
     private void processLogQueue(){
-        try(BufferedWriter writer=new BufferedWriter(new FileWriter(logFilePath, true))){
-            while (running||!logQueue.isEmpty()) {
-                String logLine=logQueue.take();
-                writer.write(logLine);
-                writer.flush();
+        try(FileOutputStream fos = new FileOutputStream(logFilePath, true);
+            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(fos, StandardCharsets.UTF_8))) {
+            while (running || !logQueue.isEmpty()) {
+                Object first = logQueue.take();
+                if (first == SHUTDOWN_SIGNAL) break;
+
+                writer.write((String) first);
+                boolean wroteAny = true;
+
+                // Drain whatever else is already waiting so concurrent
+                // writes share one flush+fsync (group commit) instead of
+                // paying a disk sync per single write.
+                Object next;
+                while ((next = logQueue.poll()) != null) {
+                    if (next == SHUTDOWN_SIGNAL) {
+                        running = false;
+                        break;
+                    }
+                    writer.write((String) next);
+                }
+
+                if (wroteAny) {
+                    writer.flush();
+                    // Force the write to physical disk, not just the OS
+                    // buffer, so a completed write really survives a crash
+                    // or power loss right after the client got "OK".
+                    fos.getFD().sync();
+                }
             }
         }
         catch(IOException|InterruptedException e){
@@ -147,6 +193,16 @@ public class AeroWAL {
 
     public void shutdown(){
         this.running=false;
-        logQueue.offer("SHUTDOWN\n");
+        try {
+            logQueue.put(SHUTDOWN_SIGNAL);
+            // Wait for the writer thread to drain and fsync everything
+            // still queued, so a graceful shutdown actually finishes
+            // writing before the process exits, instead of racing it.
+            if (writerThread != null) {
+                writerThread.join(5000);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }
